@@ -2,6 +2,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
+import asyncio
 
 from langgraph.constants import Send
 from langgraph.graph import START, END, StateGraph
@@ -113,8 +114,36 @@ def write_section(state: SectionState):
     section = state["section"]
     source_str = state["source_str"]
 
+    # Limit the source string size to reduce token count while preserving complete sentences
+    limited_sources = []
+    for source in source_str.split("\n\nSource:"):
+        if not source.strip():
+            continue
+            
+        # Split source into sentences (roughly)
+        sentences = [s.strip() + "." for s in source.replace("\n", " ").split(".") if s.strip()]
+        
+        # Calculate rough token count (4 chars ~= 1 token)
+        total_chars = 0
+        limited_source = []
+        
+        # Keep sentences up to roughly 1000 tokens (4000 chars), preserving complete sentences
+        for sentence in sentences:
+            sentence_chars = len(sentence)
+            if total_chars + sentence_chars > 4000:
+                break
+            limited_source.append(sentence)
+            total_chars += sentence_chars
+            
+        if limited_source:
+            # Reconstruct source with complete sentences
+            limited_sources.append(f"Source:{' '.join(limited_source)}")
+    
+    # Join all limited sources
+    limited_source_str = "\n\n".join(limited_sources)
+
     # Format system instructions
-    system_instructions = section_writer_instructions.format(section_title=section.name, section_topic=section.description, context=source_str)
+    system_instructions = section_writer_instructions.format(section_title=section.name, section_topic=section.description, context=limited_source_str)
 
     # Generate section  
     section_content = writer_model.invoke([SystemMessage(content=system_instructions)]+[HumanMessage(content="Generate a report section based on the provided sources.")])
@@ -146,15 +175,36 @@ def initiate_section_writing(state: ReportState):
             if s.research
         ]
 
-def write_final_sections(state: SectionState):
+async def write_final_sections(state: SectionState):
     """ Write final sections of the report, which do not require web search and use the completed sections as context """
+
+    # Add delay to avoid rate limits
+    await asyncio.sleep(2)  # 2 second delay
 
     # Get state 
     section = state["section"]
     completed_report_sections = state["report_sections_from_research"]
     
+    # Limit context size by taking only the most relevant sections
+    # For introduction, we want a brief overview of all sections
+    # For conclusion, we want detailed content from all sections
+    max_tokens_per_section = 2000 if section.name.lower() == "conclusion" else 500
+    
+    # Split into sections and limit each section's size
+    sections = completed_report_sections.split("="*60)
+    limited_sections = []
+    for s in sections:
+        if len(s.strip()) > 0:  # Skip empty sections
+            # Keep section header and first part up to max_tokens_per_section
+            section_parts = s.split("\n", 3)  # Split into: newline, title, newline, content
+            if len(section_parts) >= 4:
+                limited_content = section_parts[3][:max_tokens_per_section]
+                limited_sections.append(f"\n{'='*60}{section_parts[1]}\n{'='*60}\n{limited_content}")
+    
+    limited_context = "\n".join(limited_sections)
+    
     # Format system instructions
-    system_instructions = final_section_writer_instructions.format(section_title=section.name, section_topic=section.description, context=completed_report_sections)
+    system_instructions = final_section_writer_instructions.format(section_title=section.name, section_topic=section.description, context=limited_context)
 
     # Generate section  
     section_content = writer_model.invoke([SystemMessage(content=system_instructions)]+[HumanMessage(content="Generate a report section based on the provided sources.")])
@@ -177,28 +227,49 @@ def gather_completed_sections(state: ReportState):
     return {"report_sections_from_research": completed_report_sections}
 
 def initiate_final_section_writing(state: ReportState):
-    """ Write any final sections using the Send API to parallelize the process """    
+    """ Write any final sections sequentially to avoid rate limits """    
 
-    # Kick off section writing in parallel via Send() API for any sections that do not require research
-    return [
-        Send("write_final_sections", {"section": s, "report_sections_from_research": state["report_sections_from_research"]}) 
-        for s in state["sections"] 
-        if not s.research
-    ]
+    # Get all sections that don't require research
+    non_research_sections = [s for s in state["sections"] if not s.research]
+    
+    # Get names of completed sections
+    completed_section_names = {s.name for s in state["completed_sections"]}
+    
+    # Find the first unwritten non-research section
+    for section in non_research_sections:
+        if section.name not in completed_section_names:
+            return Send("write_final_sections", {"section": section, "report_sections_from_research": state["report_sections_from_research"]})
+    
+    # If all sections are written, move to final compilation
+    return "compile_final_report"
 
 def compile_final_report(state: ReportState):
     """ Compile the final report """    
 
-    # Get sections
+    # Get sections and completed sections
     sections = state["sections"]
-    completed_sections = {s.name: s.content for s in state["completed_sections"]}
+    completed_sections = state["completed_sections"]
+    
+    # Create a map of section name to content
+    section_content_map = {s.name: s.content for s in completed_sections}
+    
+    # Verify all sections are completed
+    missing_sections = []
+    for section in sections:
+        if section.name not in section_content_map:
+            missing_sections.append(section.name)
+    
+    if missing_sections:
+        raise ValueError(f"Missing content for sections: {', '.join(missing_sections)}")
 
     # Update sections with completed content while maintaining original order
+    final_sections = []
     for section in sections:
-        section.content = completed_sections[section.name]
+        section.content = section_content_map[section.name]
+        final_sections.append(section.content)
 
     # Compile final report
-    all_sections = "\n\n".join([s.content for s in sections])
+    all_sections = "\n\n".join(final_sections)
 
     return {"final_report": all_sections}
 
@@ -232,8 +303,8 @@ builder.add_edge(START, "generate_report_plan")
 builder.add_edge("generate_report_plan", "human_feedback")
 builder.add_conditional_edges("human_feedback", initiate_section_writing, ["build_section_with_web_research", "generate_report_plan"])
 builder.add_edge("build_section_with_web_research", "gather_completed_sections")
-builder.add_conditional_edges("gather_completed_sections", initiate_final_section_writing, ["write_final_sections"])
-builder.add_edge("write_final_sections", "compile_final_report")
+builder.add_conditional_edges("gather_completed_sections", initiate_final_section_writing, ["write_final_sections", "compile_final_report"])
+builder.add_edge("write_final_sections", "gather_completed_sections")
 builder.add_edge("compile_final_report", END)
 
 graph = builder.compile(interrupt_before=['human_feedback'])
